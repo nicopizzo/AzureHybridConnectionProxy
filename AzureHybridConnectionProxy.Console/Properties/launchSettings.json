@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "AzureHybridConnectionProxy.Console": {
+      "commandName": "Project"
+    },
+    "Docker": {
+      "commandName": "Docker"
+    }
+  }
+}
