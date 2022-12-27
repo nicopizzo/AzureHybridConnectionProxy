@@ -127,7 +127,10 @@ namespace AzureHybridConnectionProxy.Core
             foreach(string key in headers)
             {
                 var value = headers[key];
-                newHeaders.Add(key, value);
+                if(!newHeaders.TryAddWithoutValidation(key, value))
+                {
+                    _Logger.LogInformation("Failed to add the following header: {0}, {1}", key, value);
+                }
             }
         }
     }
