@@ -9,6 +9,7 @@ namespace AzureHybridConnectionProxy.Core
     public interface IHCListener
     {
         Task StartListening(CancellationToken cancellationToken = default);
+        Task StopListening(CancellationToken cancellationToken = default);
     }
 
     internal class HCListener : IHCListener
@@ -17,7 +18,8 @@ namespace AzureHybridConnectionProxy.Core
         private readonly HCOptions _Options;
         private readonly HttpClient _ForwardClient;
 
-        private CancellationToken _CancellationToken;
+        private CancellationToken _LongRunningCt;
+        private HybridConnectionListener? _Listener;
 
         public HCListener(HttpClient forwardClient, IOptions<HCOptions> options, ILogger<HCListener> logger)
         {
@@ -28,28 +30,63 @@ namespace AzureHybridConnectionProxy.Core
 
         public async Task StartListening(CancellationToken cancellationToken = default)
         {
-            _CancellationToken = cancellationToken;
+            if(_Listener != null && _Listener.IsOnline)
+            {
+                throw new AlreadyRunningException();
+            }
+
+            _LongRunningCt = cancellationToken;
             var hcmConnection = $"{_Options.RelayNamespace}/{_Options.RelayConnectionName}";
             _Logger.LogInformation("Starting to listen at {0}", hcmConnection);
             var tokenProvider = TokenProvider.CreateSharedAccessSignatureTokenProvider(_Options.KeyName, _Options.Key);
-            var listener = new HybridConnectionListener(new Uri(hcmConnection), tokenProvider);
+            _Listener = new HybridConnectionListener(new Uri(hcmConnection), tokenProvider)
+            {
+                RequestHandler = OnNewRequest
+            };
 
-            listener.RequestHandler = OnNewRequest;
             _Logger.LogDebug("Opening the hybrid connection");
-            await listener.OpenAsync(_CancellationToken);
-            _Logger.LogInformation($"Now Listening...");
+            await _Listener.OpenAsync(_LongRunningCt);
+            _Logger.LogInformation("Now Listening...");
+        }
+
+        public async Task StopListening(CancellationToken cancellationToken = default)
+        {
+            _Logger.LogInformation("Shutting down listener");
+            if (_Listener == null)
+            {
+                _Logger.LogInformation("No listener available");
+                return;
+            }
+            await _Listener.CloseAsync(cancellationToken);
         }
 
         private async void OnNewRequest(RelayedHttpListenerContext context)
         {
             _Logger.LogInformation("New Request from {0}", context.Request.RemoteEndPoint.ToString());
-            var newRequest = CreateForwardRequest(context);
-            var response = await _ForwardClient.SendAsync(newRequest, _CancellationToken);
-            await ConvertForwardResponse(context, response);
-         
-            await context.Response.CloseAsync();
+            try
+            {
+                var newRequest = CreateForwardRequest(context);
+                var response = await _ForwardClient.SendAsync(newRequest, _LongRunningCt);
+                await ConvertForwardResponse(context, response);
 
+                await context.Response.CloseAsync();
+            }
+            catch(Exception ex)
+            {
+                _Logger.LogError(ex, "Failed to handle request");
+                HandleNewRequestException(ex, context);
+            }
             _Logger.LogInformation("Handled Request from {0}", context.Request.RemoteEndPoint.ToString());
+        }
+
+        private void HandleNewRequestException(Exception ex, RelayedHttpListenerContext context)
+        {
+            context.Response.StatusCode = HttpStatusCode.InternalServerError;
+            using (var responseStream = new StreamWriter(context.Response.OutputStream))
+            {
+                responseStream.WriteLine("Request recieved but forwarded request was not handled:");
+                responseStream.Write(ex.ToString());
+            }
         }
 
         private HttpRequestMessage CreateForwardRequest(RelayedHttpListenerContext context)
